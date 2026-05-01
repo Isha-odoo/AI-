@@ -8,18 +8,39 @@ import google.generativeai as genai
 app = Flask(__name__)
 
 # =========================
-# GEMINI CONFIG
+# HOME ROUTE
 # =========================
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel("gemini-pro")
+@app.route("/")
+def home():
+    return "Server is running ✅"
 
 # =========================
-# ODOO CONFIG (ENV VARIABLES)
+# SAFE GEMINI CONFIG
+# =========================
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-pro")
+        print("✅ Gemini configured")
+    except Exception as e:
+        print("❌ Gemini error:", e)
+        model = None
+else:
+    print("❌ GEMINI_API_KEY missing")
+    model = None
+
+# =========================
+# ODOO CONFIG
 # =========================
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USERNAME = os.getenv("ODOO_USERNAME")
 ODOO_PASSWORD = os.getenv("ODOO_API_KEY")
+
+if not all([ODOO_URL, ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD]):
+    print("❌ Odoo credentials missing")
 
 # =========================
 # REGEX FALLBACK
@@ -34,9 +55,12 @@ def regex_extract(text):
     }
 
 # =========================
-# GEMINI EXTRACTION
+# AI EXTRACTION (SAFE)
 # =========================
 def ai_extract(text):
+    if not model:
+        return {}
+
     prompt = f"""
     Extract buyer details from this email.
 
@@ -69,75 +93,87 @@ def ai_extract(text):
         response = model.generate_content(prompt)
         raw = response.text.strip().replace("```json", "").replace("```", "")
         return json.loads(raw)
-    except:
+    except Exception as e:
+        print("❌ AI error:", e)
         return {}
 
 # =========================
-# ODOO CREATE LEAD
+# ODOO CREATE LEAD (SAFE)
 # =========================
 def create_odoo_lead(data):
-    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-    uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
+    if not all([ODOO_URL, ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD]):
+        return "Odoo not configured"
 
-    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+    try:
+        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+        uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
 
-    lead_vals = {
-        'name': data.get('product') or "New Lead",
-        'contact_name': data.get('name'),
-        'phone': data.get('phone'),
-        'email_from': data.get('email'),
-    }
+        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-    # Optional: Country mapping
-    if data.get("country"):
-        country_ids = models.execute_kw(
+        lead_vals = {
+            'name': data.get('product') or "New Lead",
+            'contact_name': data.get('name'),
+            'phone': data.get('phone'),
+            'email_from': data.get('email'),
+        }
+
+        # Country mapping
+        if data.get("country"):
+            country_ids = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'res.country', 'search',
+                [[('name', 'ilike', data.get("country"))]],
+                {'limit': 1}
+            )
+            if country_ids:
+                lead_vals['country_id'] = country_ids[0]
+
+        lead_id = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
-            'res.country', 'search',
-            [[('name', 'ilike', data.get("country"))]],
-            {'limit': 1}
+            'crm.lead', 'create',
+            [lead_vals]
         )
-        if country_ids:
-            lead_vals['country_id'] = country_ids[0]
 
-    lead_id = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        'crm.lead', 'create',
-        [lead_vals]
-    )
+        return lead_id
 
-    return lead_id
+    except Exception as e:
+        print("❌ Odoo error:", e)
+        return "Error creating lead"
 
 # =========================
 # MAIN API
 # =========================
 @app.route("/extract", methods=["POST"])
 def extract():
-    data = request.json
-    text = data.get("text", "")
+    try:
+        data = request.json
+        text = data.get("text", "")
 
-    # Step 1: AI extraction
-    result = ai_extract(text)
+        # Step 1: AI
+        result = ai_extract(text)
 
-    # Step 2: Regex fallback
-    regex_data = regex_extract(text)
+        # Step 2: Regex fallback
+        regex_data = regex_extract(text)
 
-    if not result.get("phone"):
-        result["phone"] = regex_data["phone"]
+        if not result.get("phone"):
+            result["phone"] = regex_data["phone"]
 
-    if not result.get("email"):
-        result["email"] = regex_data["email"]
+        if not result.get("email"):
+            result["email"] = regex_data["email"]
 
-    # Step 3: Create lead in Odoo
-    lead_id = create_odoo_lead(result)
+        # Step 3: Create lead
+        lead_id = create_odoo_lead(result)
 
-    result["odoo_lead_id"] = lead_id
+        result["odoo_lead_id"] = lead_id
 
-    return jsonify(result)
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 # =========================
-# RUN APP
+# RUN APP (RENDER FIX)
 # =========================
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
