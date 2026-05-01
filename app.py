@@ -108,6 +108,9 @@ def create_odoo_lead(data):
         common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
         uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
 
+        if not uid:
+            return "Authentication failed"
+
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
         lead_vals = {
@@ -137,9 +140,7 @@ def create_odoo_lead(data):
         return lead_id
 
     except Exception as e:
-        print("❌ Odoo error:", e)
-        return "Error creating lead"
-
+        return str(e)   # ✅ Properly inside function
 # =========================
 # MAIN API
 # =========================
