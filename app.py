@@ -15,7 +15,7 @@ def home():
     return "Server is running ✅"
 
 # =========================
-# SAFE GEMINI CONFIG
+# GEMINI CONFIG
 # =========================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -55,39 +55,31 @@ def regex_extract(text):
     }
 
 # =========================
-# AI EXTRACTION (SAFE)
+# AI EXTRACTION
 # =========================
 def ai_extract(text):
     if not model:
         return {}
 
     prompt = f"""
-    Extract buyer details from this email.
+Extract buyer details from this text.
 
-    Ignore:
-    - Platform emails (IndiaMART, Alibaba, Expo)
-    - Footer, unsubscribe, ads
-    - Helpline numbers
+Ignore:
+- Spam, ads, platform emails (IndiaMART, Alibaba, etc.)
+- Footer, unsubscribe content
 
-    Extract:
-    - name
-    - phone
-    - email (customer email only)
-    - product
-    - country
+Return ONLY JSON:
+{{
+  "name": "",
+  "phone": "",
+  "email": "",
+  "product": "",
+  "country": ""
+}}
 
-    Return ONLY JSON:
-    {{
-      "name": "",
-      "phone": "",
-      "email": "",
-      "product": "",
-      "country": ""
-    }}
-
-    Email:
-    {text}
-    """
+Text:
+{text}
+"""
 
     try:
         response = model.generate_content(prompt)
@@ -98,26 +90,34 @@ def ai_extract(text):
         return {}
 
 # =========================
-# ODOO CREATE LEAD (SAFE)
+# ODOO CREATE LEAD (FIXED)
 # =========================
 def create_odoo_lead(data):
     if not all([ODOO_URL, ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD]):
-        return "Odoo not configured"
+        return None, "Odoo not configured"
 
     try:
-        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+        # IMPORTANT FIX: allow_none=True
+        common = xmlrpc.client.ServerProxy(
+            f"{ODOO_URL}/xmlrpc/2/common",
+            allow_none=True
+        )
+
+        models = xmlrpc.client.ServerProxy(
+            f"{ODOO_URL}/xmlrpc/2/object",
+            allow_none=True
+        )
+
         uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
 
         if not uid:
-            return "Authentication failed"
-
-        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+            return None, "Authentication failed"
 
         lead_vals = {
             'name': data.get('product') or "New Lead",
-            'contact_name': data.get('name'),
-            'phone': data.get('phone'),
-            'email_from': data.get('email'),
+            'contact_name': data.get('name') or "",
+            'phone': data.get('phone') or "",
+            'email_from': data.get('email') or "",
         }
 
         # Country mapping
@@ -137,10 +137,12 @@ def create_odoo_lead(data):
             [lead_vals]
         )
 
-        return lead_id
+        return lead_id, None
 
     except Exception as e:
-        return str(e)   # ✅ Properly inside function
+        print("❌ Odoo error:", e)
+        return None, str(e)
+
 # =========================
 # MAIN API
 # =========================
@@ -150,7 +152,7 @@ def extract():
         data = request.json
         text = data.get("text", "")
 
-        # Step 1: AI
+        # Step 1: AI extraction
         result = ai_extract(text)
 
         # Step 2: Regex fallback
@@ -162,10 +164,13 @@ def extract():
         if not result.get("email"):
             result["email"] = regex_data["email"]
 
-        # Step 3: Create lead
-        lead_id = create_odoo_lead(result)
+        # Step 3: Create Odoo lead
+        lead_id, error = create_odoo_lead(result)
 
+        # Step 4: Clean response
         result["odoo_lead_id"] = lead_id
+        if error:
+            result["odoo_error"] = error
 
         return jsonify(result)
 
@@ -173,7 +178,7 @@ def extract():
         return jsonify({"error": str(e)})
 
 # =========================
-# RUN APP (RENDER FIX)
+# RUN APP
 # =========================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
