@@ -4,18 +4,30 @@ import re
 import os
 import json
 import xmlrpc.client
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 app = FastAPI()
 
 class EmailRequest(BaseModel):
     text: str
 
+# Define the exact structure we want Gemini to output
+class LeadSchema(BaseModel):
+    name: str
+    phone: str
+    email: str
+    product: str
+    description: str
+    city: str
+    state: str
+    country: str
+
 # =========================
-# GEMINI CONFIG
+# INIT NEW GEMINI SDK
 # =========================
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel("gemini-1.5-flash")
+# It automatically looks for the GEMINI_API_KEY environment variable
+client = genai.Client()
 
 # =========================
 # ODOO CONFIG
@@ -44,51 +56,46 @@ def regex_extract(text):
     }
 
 # =========================
-# AI EXTRACTION (PRIMARY)
+# AI EXTRACTION (NEW SDK)
 # =========================
 def ai_extract(text):
-    prompt = f"""
-You are a CRM data extraction AI. Extract the buyer's details from this B2B lead email.
-Ignore platform boilerplate (like "Buy Lead through IndiaMART" or "096-9696-9696").
+    prompt = """
+You are a precise CRM data extraction assistant specializing in B2B platform lead emails (e.g., IndiaMART). 
+Extract the ACTUAL BUYER'S information. Completely ignore platform support numbers (like 096-9696-9696) and platform emails (like buyleads@indiamart.com).
 
 RULES:
-1. name: Extract the buyer's personal name or company name (e.g., "SASHIBHUSAN SAMANTARAY" or "Shubham Medicals").
+1. name: Extract the buyer's personal name and/or company name.
 2. phone: Extract the buyer's direct phone number.
-3. email: Extract the buyer's direct email address.
-4. product: The main product they want to buy (e.g., "Gelfoam").
-5. description: Combine all product specs (Size, Plies, Color) into one readable string.
-6. city: Extract city from the address.
-7. state: Extract state from the address.
-8. country: Infer the country.
+3. email: Extract the buyer's personal/business email.
+4. product: The main item requested (e.g., under "Buylead Details" or "Product").
+5. description: Combine all product specifications into a comma-separated string.
+6. city, state, country: Extract from the address.
 
-You must strictly follow this JSON schema. All values must be strings. If a value is missing, use an empty string "".
-Schema: {{"name": str, "phone": str, "email": str, "product": str, "description": str, "city": str, "state": str, "country": str}}
-
-Text to process:
-{text}
+If a value is missing, return an empty string "".
 """
     try:
-        # Force Gemini to return perfect JSON natively
-        res = model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json"
-            )
+        response = client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=prompt + f"\n\nEMAIL TO PROCESS:\n{text}",
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=LeadSchema,
+                temperature=0.1
+            ),
         )
         
-        print("\n--- AI JSON RESPONSE ---")
-        print(res.text)
-        print("------------------------\n")
+        print("\n--- AI SUCCESS ---")
+        print(response.text)
+        print("------------------\n")
         
-        return json.loads(res.text)
+        return json.loads(response.text)
 
     except Exception as e:
-        print(f"AI EXTRACTION ERROR: {str(e)}")
+        print(f"\n--- AI EXTRACTION ERROR ---\n{str(e)}\n---------------------------\n")
         return {
             "name": "", "phone": "", "email": "", "product": "", 
             "description": "", "city": "", "state": "", "country": ""
         }
-
 
 # =========================
 # FIELD VALIDATION
@@ -100,38 +107,6 @@ def validate(data):
         data["email"] = ""
     if data.get("name") and len(data["name"]) < 3:
         data["name"] = ""
-    return data
-
-# =========================
-# SECOND AI (FILL MISSING)
-# =========================
-def ai_fill_missing(text, data):
-    missing_fields = [k for k, v in data.items() if not v]
-    if not missing_fields:
-        return data
-
-    prompt = f"""
-Fill ONLY missing fields: {missing_fields}
-Existing data: {json.dumps(data)}
-
-Text: {text}
-
-You must respond strictly in JSON format using the missing fields as keys.
-"""
-    try:
-        res = model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json"
-            )
-        )
-        extra = json.loads(res.text)
-        for k in missing_fields:
-            if extra.get(k):
-                data[k] = extra[k]
-    except Exception as e:
-        print(f"SECOND AI ERROR: {str(e)}")
-
     return data
 
 # =========================
@@ -169,7 +144,7 @@ def create_odoo_lead(data):
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=True)
 
         lead_vals = {
-            'name': data.get('product') or "New Lead",
+            'name': data.get('product') or "New Platform Lead",
             'contact_name': data.get('name') or "",
             'phone': data.get('phone') or "",
             'email_from': data.get('email') or "",
@@ -193,23 +168,29 @@ def create_odoo_lead(data):
 def extract(request: EmailRequest):
     text = clean_html(request.text)
 
+    # 1. Extract via AI and Regex
     ai_data = ai_extract(text)
     regex_data = regex_extract(text)
+    
+    # 2. Merge & Validate
     data = merge(ai_data, regex_data)
-    data = validate(data)
-    data = ai_fill_missing(text, data)
     data = validate(data)
 
     print("FINAL DATA:", data)
 
     # ==========================================
-    # GUARD: PREVENT BLANK LEADS
+    # STRICT GUARD: PREVENT BLANK / GHOST LEADS
     # ==========================================
-    if not data.get("phone") and not data.get("email") and not data.get("name") and not data.get("product"):
-        print("SKIPPED: No actionable data found. Odoo lead not created.")
-        data["odoo_error"] = "Skipped: Payload empty or no contact/product info extracted."
+    # Must have contact info AND context (Name or Product)
+    has_contact = bool(data.get("phone") or data.get("email"))
+    has_context = bool(data.get("name") or data.get("product"))
+
+    if not (has_contact and has_context):
+        print("SKIPPED: Not a valid lead. Dropping payload to protect Odoo.")
+        data["odoo_error"] = "Skipped: Incomplete lead payload."
         return data
 
+    # 3. Push to Odoo
     lead_id, error = create_odoo_lead(data)
     data["odoo_lead_id"] = lead_id
     if error:
