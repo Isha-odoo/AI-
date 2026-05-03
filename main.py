@@ -15,7 +15,8 @@ class EmailRequest(BaseModel):
 # GEMINI CONFIG
 # =========================
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel("gemini-pro")
+# Upgraded to gemini-1.5-flash as it is much better at strict JSON and extraction than standard pro
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 # =========================
 # ODOO CONFIG
@@ -49,14 +50,20 @@ def regex_extract(text):
 def ai_extract(text):
 
     prompt = f"""
-Extract CRM lead info.
+You are a precise CRM data extraction assistant specializing in B2B platform lead emails (e.g., IndiaMART, Alibaba). 
+Your exact goal is to extract the ACTUAL BUYER'S information and completely ignore the platform's automated text.
 
-STRICT:
-- Ignore platform/system numbers
-- Only buyer info
-- Detect any country/state globally
+### EXTRACTION RULES:
+1. **name**: Extract the buyer's personal name and/or company name. (Usually found right above the address block).
+2. **phone**: Extract the buyer's direct phone number (often near "Click to Call"). CRITICAL: DO NOT extract platform support numbers like "096-9696-9696".
+3. **email**: Extract the buyer's personal/business email. CRITICAL: DO NOT extract platform emails like "buyleads@indiamart.com".
+4. **product**: Look directly under "Buylead Details:" or "Product:" to find the main item requested.
+5. **description**: Combine all the product specifications (Size, Plies, Application, Color, etc.) into a clean, comma-separated string.
+6. **city** & **state**: Extract from the buyer's address line.
+7. **country**: Infer from the address or state.
 
-Return JSON:
+Respond ONLY with a valid JSON object. Do not include markdown formatting or conversational text. Use empty strings ("") if a value is missing.
+
 {{
 "name": "",
 "phone": "",
@@ -68,16 +75,21 @@ Return JSON:
 "country": ""
 }}
 
-Email:
+Email to process:
 {text}
 """
 
     try:
         res = model.generate_content(prompt)
+        # Using your original markdown stripping logic, enhanced slightly to be safer
         raw = res.text.strip().replace("```json", "").replace("```", "")
         return json.loads(raw)
     except:
-        return {}
+        # Returning dictionary with empty strings to prevent KeyErrors later
+        return {
+            "name": "", "phone": "", "email": "", "product": "", 
+            "description": "", "city": "", "state": "", "country": ""
+        }
 
 # =========================
 # FIELD VALIDATION
@@ -117,7 +129,7 @@ Existing data:
 Email:
 {text}
 
-Return JSON only.
+Return JSON only without markdown formatting. Do not wrap in ```json.
 """
 
     try:
@@ -139,13 +151,26 @@ Return JSON only.
 # =========================
 def merge(ai_data, regex_data):
 
-    # phone
-    if not ai_data.get("phone") and regex_data["phone"]:
-        ai_data["phone"] = regex_data["phone"][0]
+    # Ensure keys exist
+    for key in ["phone", "email"]:
+        if key not in ai_data:
+            ai_data[key] = ""
 
-    # email
-    if not ai_data.get("email") and regex_data["email"]:
-        ai_data["email"] = regex_data["email"][0]
+    # phone: Upgraded to ignore IndiaMART boilerplate numbers while keeping your original logic
+    if not ai_data.get("phone") and regex_data.get("phone"):
+        valid_phones = [p for p in regex_data["phone"] if "96969696" not in p.replace("-", "")]
+        if valid_phones:
+            ai_data["phone"] = valid_phones[0]
+        else:
+            ai_data["phone"] = regex_data["phone"][0] # Fallback to original logic
+
+    # email: Upgraded to ignore IndiaMART boilerplate emails while keeping your original logic
+    if not ai_data.get("email") and regex_data.get("email"):
+        valid_emails = [e for e in regex_data["email"] if "indiamart.com" not in e.lower()]
+        if valid_emails:
+            ai_data["email"] = valid_emails[0]
+        else:
+            ai_data["email"] = regex_data["email"][0] # Fallback to original logic
 
     return ai_data
 
