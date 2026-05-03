@@ -1,18 +1,25 @@
-from flask import Flask, request, jsonify
+from fastapi import FastAPI
+from pydantic import BaseModel
 import re
 import os
 import json
 import xmlrpc.client
 import google.generativeai as genai
 
-app = Flask(__name__)
+app = FastAPI()
+
+# =========================
+# REQUEST MODEL
+# =========================
+class EmailRequest(BaseModel):
+    text: str
 
 # =========================
 # HOME ROUTE
 # =========================
-@app.route("/")
+@app.get("/")
 def home():
-    return "Server is running ✅"
+    return {"message": "FastAPI server running ✅"}
 
 # =========================
 # GEMINI CONFIG
@@ -39,9 +46,6 @@ ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USERNAME = os.getenv("ODOO_USERNAME")
 ODOO_PASSWORD = os.getenv("ODOO_API_KEY")
 
-if not all([ODOO_URL, ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD]):
-    print("❌ Odoo credentials missing")
-
 # =========================
 # REGEX FALLBACK
 # =========================
@@ -63,10 +67,6 @@ def ai_extract(text):
 
     prompt = f"""
 Extract buyer details from this text.
-
-Ignore:
-- Spam, ads, platform emails (IndiaMART, Alibaba, etc.)
-- Footer, unsubscribe content
 
 Return ONLY JSON:
 {{
@@ -90,14 +90,10 @@ Text:
         return {}
 
 # =========================
-# ODOO CREATE LEAD (FIXED)
+# ODOO CREATE LEAD
 # =========================
 def create_odoo_lead(data):
-    if not all([ODOO_URL, ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD]):
-        return None, "Odoo not configured"
-
     try:
-        # IMPORTANT FIX: allow_none=True
         common = xmlrpc.client.ServerProxy(
             f"{ODOO_URL}/xmlrpc/2/common",
             allow_none=True
@@ -111,7 +107,7 @@ def create_odoo_lead(data):
         uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
 
         if not uid:
-            return None, "Authentication failed"
+            return None, "Auth failed"
 
         lead_vals = {
             'name': data.get('product') or "New Lead",
@@ -119,17 +115,6 @@ def create_odoo_lead(data):
             'phone': data.get('phone') or "",
             'email_from': data.get('email') or "",
         }
-
-        # Country mapping
-        if data.get("country"):
-            country_ids = models.execute_kw(
-                ODOO_DB, uid, ODOO_PASSWORD,
-                'res.country', 'search',
-                [[('name', 'ilike', data.get("country"))]],
-                {'limit': 1}
-            )
-            if country_ids:
-                lead_vals['country_id'] = country_ids[0]
 
         lead_id = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
@@ -140,46 +125,28 @@ def create_odoo_lead(data):
         return lead_id, None
 
     except Exception as e:
-        print("❌ Odoo error:", e)
         return None, str(e)
 
 # =========================
 # MAIN API
 # =========================
-@app.route("/extract", methods=["POST"])
-def extract():
-    try:
-        data = request.json
-        text = data.get("text", "")
+@app.post("/extract")
+def extract(request: EmailRequest):
+    text = request.text
 
-        # Step 1: AI extraction
-        result = ai_extract(text)
+    result = ai_extract(text)
+    regex_data = regex_extract(text)
 
-        # Step 2: Regex fallback
-        regex_data = regex_extract(text)
+    if not result.get("phone"):
+        result["phone"] = regex_data["phone"]
 
-        if not result.get("phone"):
-            result["phone"] = regex_data["phone"]
+    if not result.get("email"):
+        result["email"] = regex_data["email"]
 
-        if not result.get("email"):
-            result["email"] = regex_data["email"]
+    lead_id, error = create_odoo_lead(result)
 
-        # Step 3: Create Odoo lead
-        lead_id, error = create_odoo_lead(result)
+    result["odoo_lead_id"] = lead_id
+    if error:
+        result["odoo_error"] = error
 
-        # Step 4: Clean response
-        result["odoo_lead_id"] = lead_id
-        if error:
-            result["odoo_error"] = error
-
-        return jsonify(result)
-
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
-# =========================
-# RUN APP
-# =========================
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    return result
