@@ -48,53 +48,39 @@ def regex_extract(text):
 # =========================
 def ai_extract(text):
     prompt = f"""
-You are a precise CRM data extraction assistant specializing in B2B platform lead emails (e.g., IndiaMART, Alibaba). 
-Your exact goal is to extract the ACTUAL BUYER'S information and completely ignore the platform's automated text.
+You are a CRM data extraction AI. Extract the buyer's details from this B2B lead email.
+Ignore platform boilerplate (like "Buy Lead through IndiaMART" or "096-9696-9696").
 
-### EXTRACTION RULES:
-1. **name**: Extract the buyer's personal name and/or company name. (Usually found right above the address block).
-2. **phone**: Extract the buyer's direct phone number (often near "Click to Call"). CRITICAL: DO NOT extract platform support numbers like "096-9696-9696".
-3. **email**: Extract the buyer's personal/business email. CRITICAL: DO NOT extract platform emails like "buyleads@indiamart.com".
-4. **product**: Look directly under "Buylead Details:" or "Product:" to find the main item requested.
-5. **description**: Combine all the product specifications (Size, Plies, Application, Color, etc.) into a clean, comma-separated string.
-6. **city** & **state**: Extract from the buyer's address line.
-7. **country**: Infer from the address or state.
+RULES:
+1. name: Extract the buyer's personal name or company name (e.g., "SASHIBHUSAN SAMANTARAY" or "Shubham Medicals").
+2. phone: Extract the buyer's direct phone number.
+3. email: Extract the buyer's direct email address.
+4. product: The main product they want to buy (e.g., "Gelfoam").
+5. description: Combine all product specs (Size, Plies, Color) into one readable string.
+6. city: Extract city from the address.
+7. state: Extract state from the address.
+8. country: Infer the country.
 
-Respond ONLY with a valid JSON object. Do not include markdown formatting or conversational text. Use empty strings ("") if a value is missing.
+You must strictly follow this JSON schema. All values must be strings. If a value is missing, use an empty string "".
+Schema: {{"name": str, "phone": str, "email": str, "product": str, "description": str, "city": str, "state": str, "country": str}}
 
-{{
-"name": "",
-"phone": "",
-"email": "",
-"product": "",
-"description": "",
-"city": "",
-"state": "",
-"country": ""
-}}
-
-Email to process:
+Text to process:
 {text}
 """
-
     try:
-        res = model.generate_content(prompt)
+        # Force Gemini to return perfect JSON natively
+        res = model.generate_content(
+            prompt,
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json"
+            )
+        )
         
-        # LOGGING TO RENDER
-        print("\n--- RAW AI RESPONSE ---")
+        print("\n--- AI JSON RESPONSE ---")
         print(res.text)
-        print("-----------------------\n")
+        print("------------------------\n")
         
-        raw_text = res.text.strip()
-        
-        # Bulletproof JSON extraction
-        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-        if match:
-            clean_json_string = match.group(0)
-            return json.loads(clean_json_string)
-        else:
-            print("ERROR: Could not find {} in AI response.")
-            raise ValueError("No JSON found in response")
+        return json.loads(res.text)
 
     except Exception as e:
         print(f"AI EXTRACTION ERROR: {str(e)}")
@@ -102,6 +88,7 @@ Email to process:
             "name": "", "phone": "", "email": "", "product": "", 
             "description": "", "city": "", "state": "", "country": ""
         }
+
 
 # =========================
 # FIELD VALIDATION
@@ -126,19 +113,22 @@ def ai_fill_missing(text, data):
     prompt = f"""
 Fill ONLY missing fields: {missing_fields}
 Existing data: {json.dumps(data)}
-Email: {text}
-Return JSON only without markdown formatting. Do not wrap in ```json.
+
+Text: {text}
+
+You must respond strictly in JSON format using the missing fields as keys.
 """
     try:
-        res = model.generate_content(prompt)
-        raw_text = res.text.strip()
-        
-        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-        if match:
-            extra = json.loads(match.group(0))
-            for k in missing_fields:
-                if extra.get(k):
-                    data[k] = extra[k]
+        res = model.generate_content(
+            prompt,
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json"
+            )
+        )
+        extra = json.loads(res.text)
+        for k in missing_fields:
+            if extra.get(k):
+                data[k] = extra[k]
     except Exception as e:
         print(f"SECOND AI ERROR: {str(e)}")
 
