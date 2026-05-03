@@ -4,6 +4,7 @@ import re
 import os
 import json
 import xmlrpc.client
+import time
 from google import genai
 from google.genai import types
 
@@ -15,7 +16,6 @@ app = FastAPI()
 class EmailRequest(BaseModel):
     text: str
 
-# Define the exact structure we want Gemini to output
 class LeadSchema(BaseModel):
     name: str
     phone: str
@@ -29,7 +29,6 @@ class LeadSchema(BaseModel):
 # =========================
 # INIT NEW GEMINI SDK
 # =========================
-# It automatically looks for the GEMINI_API_KEY environment variable
 client = genai.Client()
 
 # =========================
@@ -43,9 +42,10 @@ ODOO_PASSWORD = os.getenv("ODOO_API_KEY")
 # =========================
 # RENDER HEALTH CHECK
 # =========================
-@app.get("/")
+# Added HEAD method so Render's ping doesn't cause a 405 error
+@app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
-    return {"status": "Live", "message": "Lead Automation API is running. Send POST requests to /extract."}
+    return {"status": "Live", "message": "Lead Automation API is running."}
 
 # =========================
 # CLEAN HTML
@@ -66,7 +66,7 @@ def regex_extract(text):
     }
 
 # =========================
-# AI EXTRACTION (NEW SDK)
+# AI EXTRACTION (WITH RETRIES)
 # =========================
 def ai_extract(text):
     prompt = """
@@ -83,29 +83,43 @@ RULES:
 
 If a value is missing, return an empty string "".
 """
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt + f"\n\nEMAIL TO PROCESS:\n{text}",
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=LeadSchema,
-                temperature=0.1
-            ),
-        )
-        
-        print("\n--- AI SUCCESS ---")
-        print(response.text)
-        print("------------------\n")
-        
-        return json.loads(response.text)
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt + f"\n\nEMAIL TO PROCESS:\n{text}",
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=LeadSchema,
+                    temperature=0.1
+                ),
+            )
+            
+            print(f"\n--- AI SUCCESS (Attempt {attempt + 1}) ---")
+            print(response.text)
+            print("------------------\n")
+            
+            return json.loads(response.text)
 
-    except Exception as e:
-        print(f"\n--- AI EXTRACTION ERROR ---\n{str(e)}\n---------------------------\n")
-        return {
-            "name": "", "phone": "", "email": "", "product": "", 
-            "description": "", "city": "", "state": "", "country": ""
-        }
+        except Exception as e:
+            error_msg = str(e)
+            print(f"\n--- AI ERROR (Attempt {attempt + 1}) ---\n{error_msg}\n---------------------------\n")
+            
+            # If the server is busy (503) or rate limited (429), wait and try again
+            if "503" in error_msg or "429" in error_msg:
+                if attempt < max_retries - 1:
+                    sleep_time = 2 ** attempt  # Waits 1 sec, then 2 secs
+                    print(f"Waiting {sleep_time} seconds before retrying...")
+                    time.sleep(sleep_time)
+                    continue
+            
+            # If it's a different error or we ran out of retries, fail safely
+            return {
+                "name": "", "phone": "", "email": "", "product": "", 
+                "description": "", "city": "", "state": "", "country": ""
+            }
 
 # =========================
 # FIELD VALIDATION
@@ -191,7 +205,6 @@ def extract(request: EmailRequest):
     # ==========================================
     # STRICT GUARD: PREVENT BLANK / GHOST LEADS
     # ==========================================
-    # Must have contact info AND context (Name or Product)
     has_contact = bool(data.get("phone") or data.get("email"))
     has_context = bool(data.get("name") or data.get("product"))
 
