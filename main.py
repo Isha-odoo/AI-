@@ -15,7 +15,6 @@ class EmailRequest(BaseModel):
 # GEMINI CONFIG
 # =========================
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-# Upgraded to gemini-1.5-flash as it is much better at strict JSON and extraction than standard pro
 model = genai.GenerativeModel("gemini-1.5-flash")
 
 # =========================
@@ -43,7 +42,7 @@ def regex_extract(text):
         "email": re.findall(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', text),
         "pincode": re.findall(r'\b\d{5,6}\b', text)
     }
-    
+
 # =========================
 # AI EXTRACTION (PRIMARY)
 # =========================
@@ -81,14 +80,14 @@ Email to process:
     try:
         res = model.generate_content(prompt)
         
-        # 1. Print the raw output to your Render Logs so we can see what the AI said
+        # LOGGING TO RENDER
         print("\n--- RAW AI RESPONSE ---")
         print(res.text)
         print("-----------------------\n")
         
         raw_text = res.text.strip()
         
-        # 2. Bulletproof JSON extraction: Find everything between { and }
+        # Bulletproof JSON extraction
         match = re.search(r'\{.*\}', raw_text, re.DOTALL)
         if match:
             clean_json_string = match.group(0)
@@ -98,9 +97,7 @@ Email to process:
             raise ValueError("No JSON found in response")
 
     except Exception as e:
-        # 3. Print the exact error so you can debug it
         print(f"AI EXTRACTION ERROR: {str(e)}")
-        
         return {
             "name": "", "phone": "", "email": "", "product": "", 
             "description": "", "city": "", "state": "", "country": ""
@@ -110,54 +107,40 @@ Email to process:
 # FIELD VALIDATION
 # =========================
 def validate(data):
-
-    # phone cleanup
     if data.get("phone"):
         data["phone"] = re.sub(r'[^\d+]', '', data["phone"])
-
-    # email check
     if data.get("email") and "@" not in data["email"]:
         data["email"] = ""
-
-    # remove junk names
     if data.get("name") and len(data["name"]) < 3:
         data["name"] = ""
-
     return data
 
 # =========================
 # SECOND AI (FILL MISSING)
 # =========================
 def ai_fill_missing(text, data):
-
     missing_fields = [k for k, v in data.items() if not v]
-
     if not missing_fields:
         return data
 
     prompt = f"""
 Fill ONLY missing fields: {missing_fields}
-
-Existing data:
-{json.dumps(data)}
-
-Email:
-{text}
-
+Existing data: {json.dumps(data)}
+Email: {text}
 Return JSON only without markdown formatting. Do not wrap in ```json.
 """
-
     try:
         res = model.generate_content(prompt)
-        raw = res.text.strip().replace("```json", "").replace("```", "")
-        extra = json.loads(raw)
-
-        for k in missing_fields:
-            if extra.get(k):
-                data[k] = extra[k]
-
-    except:
-        pass
+        raw_text = res.text.strip()
+        
+        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if match:
+            extra = json.loads(match.group(0))
+            for k in missing_fields:
+                if extra.get(k):
+                    data[k] = extra[k]
+    except Exception as e:
+        print(f"SECOND AI ERROR: {str(e)}")
 
     return data
 
@@ -165,27 +148,23 @@ Return JSON only without markdown formatting. Do not wrap in ```json.
 # MERGE LOGIC (SMART)
 # =========================
 def merge(ai_data, regex_data):
-
-    # Ensure keys exist
     for key in ["phone", "email"]:
         if key not in ai_data:
             ai_data[key] = ""
 
-    # phone: Upgraded to ignore IndiaMART boilerplate numbers while keeping your original logic
     if not ai_data.get("phone") and regex_data.get("phone"):
         valid_phones = [p for p in regex_data["phone"] if "96969696" not in p.replace("-", "")]
         if valid_phones:
             ai_data["phone"] = valid_phones[0]
         else:
-            ai_data["phone"] = regex_data["phone"][0] # Fallback to original logic
+            ai_data["phone"] = regex_data["phone"][0]
 
-    # email: Upgraded to ignore IndiaMART boilerplate emails while keeping your original logic
     if not ai_data.get("email") and regex_data.get("email"):
         valid_emails = [e for e in regex_data["email"] if "indiamart.com" not in e.lower()]
         if valid_emails:
             ai_data["email"] = valid_emails[0]
         else:
-            ai_data["email"] = regex_data["email"][0] # Fallback to original logic
+            ai_data["email"] = regex_data["email"][0]
 
     return ai_data
 
@@ -194,14 +173,10 @@ def merge(ai_data, regex_data):
 # =========================
 def create_odoo_lead(data):
     try:
-        common = xmlrpc.client.ServerProxy(
-            f"{ODOO_URL}/xmlrpc/2/common", allow_none=True
-        )
+        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common", allow_none=True)
         uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
 
-        models = xmlrpc.client.ServerProxy(
-            f"{ODOO_URL}/xmlrpc/2/object", allow_none=True
-        )
+        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=True)
 
         lead_vals = {
             'name': data.get('product') or "New Lead",
@@ -217,9 +192,7 @@ def create_odoo_lead(data):
             'crm.lead', 'create',
             [lead_vals]
         )
-
         return lead_id, None
-
     except Exception as e:
         return None, str(e)
 
@@ -228,32 +201,18 @@ def create_odoo_lead(data):
 # =========================
 @app.post("/extract")
 def extract(request: EmailRequest):
-
     text = clean_html(request.text)
 
-    # 1. AI
     ai_data = ai_extract(text)
-
-    # 2. Regex
     regex_data = regex_extract(text)
-
-    # 3. Merge
     data = merge(ai_data, regex_data)
-
-    # 4. Validate
     data = validate(data)
-
-    # 5. Fill missing
     data = ai_fill_missing(text, data)
-
-    # 6. Final validation
     data = validate(data)
 
     print("FINAL DATA:", data)
 
-    # 7. Odoo
     lead_id, error = create_odoo_lead(data)
-
     data["odoo_lead_id"] = lead_id
     if error:
         data["odoo_error"] = error
