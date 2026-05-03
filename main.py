@@ -2,9 +2,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import re
 import os
-import json
 import xmlrpc.client
-import google.generativeai as genai
 
 app = FastAPI()
 
@@ -15,28 +13,11 @@ class EmailRequest(BaseModel):
     text: str
 
 # =========================
-# HOME ROUTE
+# HOME
 # =========================
 @app.get("/")
 def home():
-    return {"message": "FastAPI server running ✅"}
-
-# =========================
-# GEMINI CONFIG
-# =========================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-if GEMINI_API_KEY:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-pro")
-        print("✅ Gemini configured")
-    except Exception as e:
-        print("❌ Gemini error:", e)
-        model = None
-else:
-    print("❌ GEMINI_API_KEY missing")
-    model = None
+    return {"message": "FastAPI running ✅"}
 
 # =========================
 # ODOO CONFIG
@@ -50,21 +31,62 @@ ODOO_PASSWORD = os.getenv("ODOO_API_KEY")
 # CLEAN HTML
 # =========================
 def clean_html(raw_html):
-    clean = re.sub('<.*?>', ' ', raw_html)
-    clean = re.sub(r'\s+', ' ', clean)
-    return clean.strip()
+    text = re.sub('<.*?>', '\n', raw_html)
+    text = re.sub(r'\n+', '\n', text)
+    return text.strip()
 
 # =========================
-# REGEX BASIC EXTRACTION
+# EXTRACT NAME
 # =========================
-def regex_extract(text):
-    phone = re.findall(r'\+?\d{10,13}', text)
-    email = re.findall(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', text)
+def extract_name(text):
+    match = re.search(r'\n([A-Z\s]{5,})\n', text)
+    return match.group(1).strip() if match else ""
 
-    return {
-        "phone": phone[0] if phone else "",
-        "email": email[0] if email else ""
-    }
+# =========================
+# EXTRACT PHONE
+# =========================
+def extract_phone(text):
+    match = re.search(r'Click to Call:\s*(\+?\d+)', text)
+    return match.group(1) if match else ""
+
+# =========================
+# EXTRACT EMAIL
+# =========================
+def extract_email(text):
+    match = re.search(r'E-mail:\s*([^\s]+)', text)
+    return match.group(1) if match else ""
+
+# =========================
+# EXTRACT PRODUCT
+# =========================
+def extract_product(text):
+    match = re.search(r'Buylead Details:\s*\n\s*(.+)', text)
+    return match.group(1).strip() if match else ""
+
+# =========================
+# EXTRACT DESCRIPTION (ONLY SPECS)
+# =========================
+def extract_description(text):
+    match = re.search(r'Buylead Details:(.*?)Reply To This Message', text, re.S)
+    
+    if not match:
+        return ""
+
+    block = match.group(1)
+
+    # remove product line
+    lines = [l.strip() for l in block.split('\n') if l.strip()]
+    
+    if len(lines) < 2:
+        return ""
+
+    lines = lines[1:]  # remove product name
+
+    desc = ""
+    for i in range(0, len(lines)-1, 2):
+        desc += f"{lines[i]}: {lines[i+1]}\n"
+
+    return desc.strip()
 
 # =========================
 # LOCATION EXTRACTION
@@ -98,54 +120,7 @@ def extract_location(text):
     }
 
 # =========================
-# AI EXTRACTION
-# =========================
-def ai_extract(text):
-    if not model:
-        return {}
-
-    prompt = f"""
-Extract buyer details from this email.
-
-IMPORTANT:
-- Ignore IndiaMART platform info
-- Ignore helpline numbers
-- Extract ONLY buyer info
-
-Find:
-- name
-- phone
-- email
-- product
-- description (ONLY product specs like size, color, usage)
-- city
-- country
-
-Return ONLY JSON:
-{{
-  "name": "",
-  "phone": "",
-  "email": "",
-  "product": "",
-  "description": "",
-  "city": "",
-  "country": ""
-}}
-
-Email:
-{text}
-"""
-
-    try:
-        response = model.generate_content(prompt)
-        raw = response.text.strip().replace("```json", "").replace("```", "")
-        return json.loads(raw)
-    except Exception as e:
-        print("❌ AI error:", e)
-        return {}
-
-# =========================
-# ODOO CREATE LEAD
+# CREATE ODOO LEAD
 # =========================
 def create_odoo_lead(data):
     try:
@@ -191,37 +166,35 @@ def create_odoo_lead(data):
 def extract(request: EmailRequest):
     raw_text = request.text
 
-    # STEP 1: Clean HTML
+    # STEP 1: Clean
     text = clean_html(raw_text)
 
-    print("CLEAN TEXT:", text[:500])
-
-    # STEP 2: AI
-    result = ai_extract(text)
-
-    # STEP 3: Regex fallback
-    regex_data = regex_extract(text)
-
-    if not result.get("phone"):
-        result["phone"] = regex_data["phone"]
-
-    if not result.get("email"):
-        result["email"] = regex_data["email"]
-
-    # STEP 4: Location
+    # STEP 2: Extract
+    name = extract_name(text)
+    phone = extract_phone(text)
+    email = extract_email(text)
+    product = extract_product(text)
+    description = extract_description(text)
     location = extract_location(text)
 
-    result["city"] = location["city"]
-    result["country"] = location["country"]
+    result = {
+        "name": name,
+        "phone": phone,
+        "email": email,
+        "product": product,
+        "description": description,
+        "city": location["city"],
+        "country": location["country"]
+    }
 
-    # STEP 5: Create Lead
+    print("FINAL DATA:", result)
+
+    # STEP 3: Odoo
     lead_id, error = create_odoo_lead(result)
 
     result["odoo_lead_id"] = lead_id
 
     if error:
         result["odoo_error"] = error
-
-    print("FINAL RESULT:", result)
 
     return result
