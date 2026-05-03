@@ -2,22 +2,25 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import re
 import os
+import json
 import xmlrpc.client
+import google.generativeai as genai
 
 app = FastAPI()
 
-# =========================
-# REQUEST MODEL
-# =========================
 class EmailRequest(BaseModel):
     text: str
 
 # =========================
-# HOME
+# GEMINI CONFIG
 # =========================
-@app.get("/")
-def home():
-    return {"message": "FastAPI running ✅"}
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-pro")
+else:
+    model = None
 
 # =========================
 # ODOO CONFIG
@@ -36,108 +39,85 @@ def clean_html(raw_html):
     return text.strip()
 
 # =========================
-# EXTRACT NAME
+# AI EXTRACTION (SMART)
 # =========================
-def extract_name(text):
-    match = re.search(r'\n([A-Z\s]{5,})\n', text)
-    return match.group(1).strip() if match else ""
+def ai_extract(text):
+    if not model:
+        return {}
 
-# =========================
-# EXTRACT PHONE
-# =========================
-def extract_phone(text):
-    match = re.search(r'Click to Call:\s*(\+?\d+)', text)
-    return match.group(1) if match else ""
+    prompt = f"""
+You are an expert at extracting CRM lead data from emails.
 
-# =========================
-# EXTRACT EMAIL
-# =========================
-def extract_email(text):
-    match = re.search(r'E-mail:\s*([^\s]+)', text)
-    return match.group(1) if match else ""
+STRICT RULES:
+- Ignore platform emails (IndiaMART, Alibaba, Expo systems)
+- Ignore helpline numbers
+- Extract ONLY buyer/customer details
+- Understand ANY format (not fixed template)
 
-# =========================
-# EXTRACT PRODUCT
-# =========================
-def extract_product(text):
-    match = re.search(r'Buylead Details:\s*\n\s*(.+)', text)
-    return match.group(1).strip() if match else ""
+Extract:
+- name (person name)
+- phone
+- email
+- product (what buyer wants)
+- description (only product requirements/specs)
+- city
+- state
+- country
 
-# =========================
-# EXTRACT DESCRIPTION (ONLY SPECS)
-# =========================
-def extract_description(text):
-    match = re.search(r'Buylead Details:(.*?)Reply To This Message', text, re.S)
-    
-    if not match:
-        return ""
+Return ONLY valid JSON:
+{{
+  "name": "",
+  "phone": "",
+  "email": "",
+  "product": "",
+  "description": "",
+  "city": "",
+  "state": "",
+  "country": ""
+}}
 
-    block = match.group(1)
+Email:
+{text}
+"""
 
-    # remove product line
-    lines = [l.strip() for l in block.split('\n') if l.strip()]
-    
-    if len(lines) < 2:
-        return ""
-
-    lines = lines[1:]  # remove product name
-
-    desc = ""
-    for i in range(0, len(lines)-1, 2):
-        desc += f"{lines[i]}: {lines[i+1]}\n"
-
-    return desc.strip()
+    try:
+        response = model.generate_content(prompt)
+        raw = response.text.strip().replace("```json", "").replace("```", "")
+        return json.loads(raw)
+    except Exception as e:
+        print("AI ERROR:", e)
+        return {}
 
 # =========================
-# LOCATION EXTRACTION
+# REGEX FALLBACK (GENERIC)
 # =========================
-def extract_location(text):
-    match = re.search(r'([A-Za-z\s]+)-\s*(\d{6}),\s*([A-Z]{2})', text)
+def regex_fallback(text, result):
 
-    city = ""
-    pincode = ""
-    state_code = ""
+    if not result.get("phone"):
+        phone = re.findall(r'\+?\d[\d\s\-]{8,15}', text)
+        if phone:
+            result["phone"] = phone[0]
 
-    if match:
-        city = match.group(1).strip()
-        pincode = match.group(2)
-        state_code = match.group(3)
+    if not result.get("email"):
+        email = re.findall(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', text)
+        if email:
+            result["email"] = email[0]
 
-    state_map = {
-        "AN": "Andaman and Nicobar Islands",
-        "MH": "Maharashtra",
-        "GJ": "Gujarat",
-        "DL": "Delhi"
-    }
-
-    state = state_map.get(state_code, "")
-
-    return {
-        "city": city,
-        "pincode": pincode,
-        "state": state,
-        "country": "India"
-    }
+    return result
 
 # =========================
-# CREATE ODOO LEAD
+# ODOO CREATE LEAD
 # =========================
 def create_odoo_lead(data):
     try:
         common = xmlrpc.client.ServerProxy(
-            f"{ODOO_URL}/xmlrpc/2/common",
-            allow_none=True
+            f"{ODOO_URL}/xmlrpc/2/common", allow_none=True
         )
-
-        models = xmlrpc.client.ServerProxy(
-            f"{ODOO_URL}/xmlrpc/2/object",
-            allow_none=True
-        )
-
         uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
 
-        if not uid:
-            return None, "Auth failed"
+        models = xmlrpc.client.ServerProxy(
+            f"{ODOO_URL}/xmlrpc/2/object", allow_none=True
+        )
 
         lead_vals = {
             'name': data.get('product') or "New Lead",
@@ -164,37 +144,32 @@ def create_odoo_lead(data):
 # =========================
 @app.post("/extract")
 def extract(request: EmailRequest):
-    raw_text = request.text
 
     # STEP 1: Clean
-    text = clean_html(raw_text)
+    text = clean_html(request.text)
 
-    # STEP 2: Extract
-    name = extract_name(text)
-    phone = extract_phone(text)
-    email = extract_email(text)
-    product = extract_product(text)
-    description = extract_description(text)
-    location = extract_location(text)
+    print("CLEAN TEXT:", text[:300])
 
-    result = {
-        "name": name,
-        "phone": phone,
-        "email": email,
-        "product": product,
-        "description": description,
-        "city": location["city"],
-        "country": location["country"]
-    }
+    # STEP 2: AI extraction
+    result = ai_extract(text)
 
-    print("FINAL DATA:", result)
+    print("AI RESULT:", result)
 
-    # STEP 3: Odoo
+    # STEP 3: Fallback
+    result = regex_fallback(text, result)
+
+    # STEP 4: Default country if missing
+    if not result.get("country"):
+        result["country"] = "India"  # you can remove if global
+
+    # STEP 5: Create lead
     lead_id, error = create_odoo_lead(result)
 
     result["odoo_lead_id"] = lead_id
 
     if error:
         result["odoo_error"] = error
+
+    print("FINAL RESULT:", result)
 
     return result
