@@ -7,7 +7,6 @@ import xmlrpc.client
 import time
 from google import genai
 from google.genai import types
-from datetime import datetime, timedelta
 
 app = FastAPI()
 
@@ -23,8 +22,10 @@ class LeadSchema(BaseModel):
     email: str
     product: str
     description: str
+    address: str
     city: str
     state: str
+    pincode: str
     country: str
 
 # =========================
@@ -43,7 +44,6 @@ ODOO_PASSWORD = os.getenv("ODOO_API_KEY")
 # =========================
 # RENDER HEALTH CHECK
 # =========================
-# Added HEAD method so Render's ping doesn't cause a 405 error
 @app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "Live", "message": "Lead Automation API is running."}
@@ -80,7 +80,11 @@ RULES:
 3. email: Extract the buyer's personal/business email.
 4. product: The main item requested (e.g., under "Buylead Details" or "Product").
 5. description: Combine all product specifications into a comma-separated string.
-6. city, state, country: Extract from the address.
+6. address: Extract the street address or local area.
+7. city: Extract the city.
+8. state: Extract the state.
+9. pincode: Extract the postal code / zip code.
+10. country: Output ONLY the official 2-letter ISO country code (e.g., "IN" for India, "US" for United States).
 
 If a value is missing, return an empty string "".
 """
@@ -119,7 +123,7 @@ If a value is missing, return an empty string "".
             # If it's a different error or we ran out of retries, fail safely
             return {
                 "name": "", "phone": "", "email": "", "product": "", 
-                "description": "", "city": "", "state": "", "country": ""
+                "description": "", "address": "", "city": "", "state": "", "pincode": "", "country": ""
             }
 
 # =========================
@@ -159,7 +163,7 @@ def merge(ai_data, regex_data):
     return ai_data
 
 # =========================
-# CREATE ODOO LEAD (WITH TIME-BOUND DEDUPLICATION)
+# CREATE ODOO LEAD
 # =========================
 def create_odoo_lead(data):
     try:
@@ -168,49 +172,30 @@ def create_odoo_lead(data):
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=True)
 
-        # -----------------------------------------------------
-        # ANTI-SPAM: TIME-BOUND DEDUPLICATION
-        # -----------------------------------------------------
-        search_domain = []
+        # Build the full address for the description
+        desc_text = data.get('description') or ""
+        address_parts = [
+            data.get('address'), 
+            data.get('city'), 
+            data.get('state'), 
+            data.get('pincode'), 
+            data.get('country')
+        ]
+        # Filter out empty strings so it formats cleanly
+        valid_address_parts = [p for p in address_parts if p]
         
-        # 1. Match Email or Phone
-        if data.get('email'):
-            search_domain.append(('email_from', '=', data['email']))
-        elif data.get('phone'):
-            search_domain.append(('phone', '=', data['phone']))
-            
-        # 2. Match Product Name
-        if data.get('product'):
-            search_domain.append(('name', '=', data['product']))
-
-        # 3. THE FIX: Only check for leads created in the last 24 hours
-        time_limit = (datetime.utcnow() - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
-        search_domain.append(('create_date', '>=', time_limit))
-
-        if search_domain:
-            existing_leads = models.execute_kw(
-                ODOO_DB, uid, ODOO_PASSWORD,
-                'crm.lead', 'search',
-                [search_domain]
-            )
-            if existing_leads:
-                print(f"DUPLICATE PREVENTED: Recent lead already exists in Odoo (ID: {existing_leads[0]}). Skipping.")
-                return existing_leads[0], None 
-        # -----------------------------------------------------
-
-        # Add Location data into the description
-        description_text = data.get('description', '')
-        location_info = f"{data.get('city', '')}, {data.get('state', '')}, {data.get('country', '')}".strip(", ")
-        if len(location_info) > 4:
-            description_text += f"\n\nLocation: {location_info}"
+        if valid_address_parts:
+            desc_text += f"\n\nFull Address: {', '.join(valid_address_parts)}"
 
         lead_vals = {
             'name': data.get('product') or "New Platform Lead",
             'contact_name': data.get('name') or "",
             'phone': data.get('phone') or "",
             'email_from': data.get('email') or "",
-            'city': data.get('city') or "",
-            'description': description_text,
+            'street': data.get('address') or "",  # Native Odoo address field
+            'city': data.get('city') or "",       # Native Odoo city field
+            'zip': data.get('pincode') or "",     # Native Odoo zip/pincode field
+            'description': desc_text.strip(),
         }
 
         lead_id = models.execute_kw(
