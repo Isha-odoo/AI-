@@ -2,15 +2,21 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import re
 import os
+import json
 import xmlrpc.client
+import google.generativeai as genai
 
 app = FastAPI()
 
-# =========================
-# REQUEST MODEL
-# =========================
 class EmailRequest(BaseModel):
     text: str
+
+# =========================
+# GEMINI CONFIG
+# =========================
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+# Upgraded to gemini-1.5-flash as it is much better at strict JSON and extraction than standard pro
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 # =========================
 # ODOO CONFIG
@@ -24,89 +30,164 @@ ODOO_PASSWORD = os.getenv("ODOO_API_KEY")
 # CLEAN HTML
 # =========================
 def clean_html(raw_html):
-    text = re.sub(r'<.*?>', '\n', raw_html)
+    text = re.sub('<.*?>', '\n', raw_html)
     text = re.sub(r'\n+', '\n', text)
     return text.strip()
 
 # =========================
-# EXTRACT CONTACT NAME
+# STRONG REGEX EXTRACTION
 # =========================
-def extract_name(text):
-    match = re.search(r'\n([A-Z\s]{5,})\n', text)
-    return match.group(1).strip() if match else ""
-
-# =========================
-# PHONE
-# =========================
-def extract_phone(text):
-    match = re.search(r'Click to Call:\s*(\+?\d+)', text)
-    if match:
-        return match.group(1)
-
-    match = re.search(r'\+?\d[\d\s\-]{8,15}', text)
-    return match.group(0) if match else ""
-
-# =========================
-# EMAIL
-# =========================
-def extract_email(text):
-    match = re.search(r'E-mail:\s*([^\s]+)', text)
-    if match:
-        return match.group(1)
-
-    match = re.search(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', text)
-    return match.group(0) if match else ""
-
-# =========================
-# PRODUCT
-# =========================
-def extract_product(text):
-    match = re.search(r'Buylead Details:\s*\n\s*(.+)', text)
-    return match.group(1).strip() if match else ""
-
-# =========================
-# 🔥 DESCRIPTION (TABLE PARSER)
-# =========================
-def extract_description(text):
-    block = re.search(r'Buylead Details:(.*?)Reply To This Message', text, re.S)
-
-    if not block:
-        return ""
-
-    content = block.group(1)
-
-    pairs = re.findall(r'([A-Za-z /]+)\s*:\s*([A-Za-z0-9 x\-]+)', content)
-
-    description = ""
-    for key, value in pairs:
-        description += f"{key.strip()}: {value.strip()}\n"
-
-    return description.strip()
-
-# =========================
-# LOCATION
-# =========================
-def extract_location(text):
-    match = re.search(r'([A-Za-z\s]+)-\s*(\d{6}),\s*([A-Z]{2})', text)
-
-    city = ""
-    state_code = ""
-
-    if match:
-        city = match.group(1).strip()
-        state_code = match.group(3)
-
-    state_map = {
-        "AN": "Andaman and Nicobar Islands",
-        "MH": "Maharashtra",
-        "GJ": "Gujarat",
-        "DL": "Delhi"
+def regex_extract(text):
+    return {
+        "phone": re.findall(r'\+?\d[\d\s\-]{8,15}', text),
+        "email": re.findall(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', text),
+        "pincode": re.findall(r'\b\d{5,6}\b', text)
     }
+    
+# =========================
+# AI EXTRACTION (PRIMARY)
+# =========================
+def ai_extract(text):
+    prompt = f"""
+You are a precise CRM data extraction assistant specializing in B2B platform lead emails (e.g., IndiaMART, Alibaba). 
+Your exact goal is to extract the ACTUAL BUYER'S information and completely ignore the platform's automated text.
 
-    state = state_map.get(state_code, "")
-    country = "India"
+### EXTRACTION RULES:
+1. **name**: Extract the buyer's personal name and/or company name. (Usually found right above the address block).
+2. **phone**: Extract the buyer's direct phone number (often near "Click to Call"). CRITICAL: DO NOT extract platform support numbers like "096-9696-9696".
+3. **email**: Extract the buyer's personal/business email. CRITICAL: DO NOT extract platform emails like "buyleads@indiamart.com".
+4. **product**: Look directly under "Buylead Details:" or "Product:" to find the main item requested.
+5. **description**: Combine all the product specifications (Size, Plies, Application, Color, etc.) into a clean, comma-separated string.
+6. **city** & **state**: Extract from the buyer's address line.
+7. **country**: Infer from the address or state.
 
-    return city, state, country
+Respond ONLY with a valid JSON object. Do not include markdown formatting or conversational text. Use empty strings ("") if a value is missing.
+
+{{
+"name": "",
+"phone": "",
+"email": "",
+"product": "",
+"description": "",
+"city": "",
+"state": "",
+"country": ""
+}}
+
+Email to process:
+{text}
+"""
+
+    try:
+        res = model.generate_content(prompt)
+        
+        # 1. Print the raw output to your Render Logs so we can see what the AI said
+        print("\n--- RAW AI RESPONSE ---")
+        print(res.text)
+        print("-----------------------\n")
+        
+        raw_text = res.text.strip()
+        
+        # 2. Bulletproof JSON extraction: Find everything between { and }
+        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if match:
+            clean_json_string = match.group(0)
+            return json.loads(clean_json_string)
+        else:
+            print("ERROR: Could not find {} in AI response.")
+            raise ValueError("No JSON found in response")
+
+    except Exception as e:
+        # 3. Print the exact error so you can debug it
+        print(f"AI EXTRACTION ERROR: {str(e)}")
+        
+        return {
+            "name": "", "phone": "", "email": "", "product": "", 
+            "description": "", "city": "", "state": "", "country": ""
+        }
+
+# =========================
+# FIELD VALIDATION
+# =========================
+def validate(data):
+
+    # phone cleanup
+    if data.get("phone"):
+        data["phone"] = re.sub(r'[^\d+]', '', data["phone"])
+
+    # email check
+    if data.get("email") and "@" not in data["email"]:
+        data["email"] = ""
+
+    # remove junk names
+    if data.get("name") and len(data["name"]) < 3:
+        data["name"] = ""
+
+    return data
+
+# =========================
+# SECOND AI (FILL MISSING)
+# =========================
+def ai_fill_missing(text, data):
+
+    missing_fields = [k for k, v in data.items() if not v]
+
+    if not missing_fields:
+        return data
+
+    prompt = f"""
+Fill ONLY missing fields: {missing_fields}
+
+Existing data:
+{json.dumps(data)}
+
+Email:
+{text}
+
+Return JSON only without markdown formatting. Do not wrap in ```json.
+"""
+
+    try:
+        res = model.generate_content(prompt)
+        raw = res.text.strip().replace("```json", "").replace("```", "")
+        extra = json.loads(raw)
+
+        for k in missing_fields:
+            if extra.get(k):
+                data[k] = extra[k]
+
+    except:
+        pass
+
+    return data
+
+# =========================
+# MERGE LOGIC (SMART)
+# =========================
+def merge(ai_data, regex_data):
+
+    # Ensure keys exist
+    for key in ["phone", "email"]:
+        if key not in ai_data:
+            ai_data[key] = ""
+
+    # phone: Upgraded to ignore IndiaMART boilerplate numbers while keeping your original logic
+    if not ai_data.get("phone") and regex_data.get("phone"):
+        valid_phones = [p for p in regex_data["phone"] if "96969696" not in p.replace("-", "")]
+        if valid_phones:
+            ai_data["phone"] = valid_phones[0]
+        else:
+            ai_data["phone"] = regex_data["phone"][0] # Fallback to original logic
+
+    # email: Upgraded to ignore IndiaMART boilerplate emails while keeping your original logic
+    if not ai_data.get("email") and regex_data.get("email"):
+        valid_emails = [e for e in regex_data["email"] if "indiamart.com" not in e.lower()]
+        if valid_emails:
+            ai_data["email"] = valid_emails[0]
+        else:
+            ai_data["email"] = regex_data["email"][0] # Fallback to original logic
+
+    return ai_data
 
 # =========================
 # CREATE ODOO LEAD
@@ -137,10 +218,10 @@ def create_odoo_lead(data):
             [lead_vals]
         )
 
-        return lead_id
+        return lead_id, None
 
     except Exception as e:
-        return str(e)
+        return None, str(e)
 
 # =========================
 # MAIN API
@@ -150,27 +231,31 @@ def extract(request: EmailRequest):
 
     text = clean_html(request.text)
 
-    name = extract_name(text)
-    phone = extract_phone(text)
-    email = extract_email(text)
-    product = extract_product(text)
-    description = extract_description(text)
-    city, state, country = extract_location(text)
+    # 1. AI
+    ai_data = ai_extract(text)
 
-    result = {
-        "name": name,
-        "phone": phone,
-        "email": email,
-        "product": product,
-        "description": description,
-        "city": city,
-        "state": state,
-        "country": country
-    }
+    # 2. Regex
+    regex_data = regex_extract(text)
 
-    print("FINAL RESULT:", result)
+    # 3. Merge
+    data = merge(ai_data, regex_data)
 
-    lead_id = create_odoo_lead(result)
-    result["odoo_lead_id"] = lead_id
+    # 4. Validate
+    data = validate(data)
 
-    return result
+    # 5. Fill missing
+    data = ai_fill_missing(text, data)
+
+    # 6. Final validation
+    data = validate(data)
+
+    print("FINAL DATA:", data)
+
+    # 7. Odoo
+    lead_id, error = create_odoo_lead(data)
+
+    data["odoo_lead_id"] = lead_id
+    if error:
+        data["odoo_error"] = error
+
+    return data
