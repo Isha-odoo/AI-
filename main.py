@@ -46,6 +46,9 @@ ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USERNAME = os.getenv("ODOO_USERNAME")
 ODOO_PASSWORD = os.getenv("ODOO_API_KEY")
 
+if not all([ODOO_URL, ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD]):
+    print("❌ Odoo credentials missing")
+
 # =========================
 # REGEX FALLBACK
 # =========================
@@ -68,6 +71,11 @@ def ai_extract(text):
     prompt = f"""
 Extract buyer details from this text.
 
+Rules:
+- Product must be SPECIFIC (e.g., "silver ring", "gold chain")
+- Do NOT return generic words like "product"
+- If missing, return empty string ""
+
 Return ONLY JSON:
 {{
   "name": "",
@@ -84,7 +92,13 @@ Text:
     try:
         response = model.generate_content(prompt)
         raw = response.text.strip().replace("```json", "").replace("```", "")
-        return json.loads(raw)
+
+        try:
+            return json.loads(raw)
+        except:
+            print("❌ JSON parse error:", raw)
+            return {}
+
     except Exception as e:
         print("❌ AI error:", e)
         return {}
@@ -94,6 +108,8 @@ Text:
 # =========================
 def create_odoo_lead(data):
     try:
+        print("🔐 Connecting to Odoo...")
+
         common = xmlrpc.client.ServerProxy(
             f"{ODOO_URL}/xmlrpc/2/common",
             allow_none=True
@@ -107,14 +123,17 @@ def create_odoo_lead(data):
         uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
 
         if not uid:
-            return None, "Auth failed"
+            return None, "Authentication failed"
 
         lead_vals = {
-            'name': data.get('product') or "New Lead",
+            'name': f"{data.get('product', 'Inquiry')} - {data.get('name', '')}",
             'contact_name': data.get('name') or "",
             'phone': data.get('phone') or "",
             'email_from': data.get('email') or "",
+            'description': data.get('raw_text') or ""   # FULL inquiry
         }
+
+        print("📤 Sending to Odoo:", lead_vals)
 
         lead_id = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
@@ -122,9 +141,12 @@ def create_odoo_lead(data):
             [lead_vals]
         )
 
+        print("✅ Lead created:", lead_id)
+
         return lead_id, None
 
     except Exception as e:
+        print("❌ Odoo error:", e)
         return None, str(e)
 
 # =========================
@@ -134,19 +156,32 @@ def create_odoo_lead(data):
 def extract(request: EmailRequest):
     text = request.text
 
+    print("📩 Incoming text:", text)
+
+    # Step 1: AI extraction
     result = ai_extract(text)
+
+    # Step 2: Regex fallback
     regex_data = regex_extract(text)
 
-    if not result.get("phone"):
+    if not result.get("phone") and regex_data.get("phone"):
         result["phone"] = regex_data["phone"]
 
-    if not result.get("email"):
+    if not result.get("email") and regex_data.get("email"):
         result["email"] = regex_data["email"]
 
+    # Step 3: Keep full inquiry
+    result["raw_text"] = text
+
+    print("🤖 Final extracted data:", result)
+
+    # Step 4: Create Odoo lead
     lead_id, error = create_odoo_lead(result)
 
-    result["odoo_lead_id"] = lead_id
-    if error:
-        result["odoo_error"] = error
-
-    return result
+    # Step 5: Response
+    return {
+        "status": "success" if lead_id else "error",
+        "data": result,
+        "odoo_lead_id": lead_id,
+        "error": error
+    }
