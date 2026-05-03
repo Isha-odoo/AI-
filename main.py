@@ -46,15 +46,20 @@ ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USERNAME = os.getenv("ODOO_USERNAME")
 ODOO_PASSWORD = os.getenv("ODOO_API_KEY")
 
-if not all([ODOO_URL, ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD]):
-    print("❌ Odoo credentials missing")
+# =========================
+# CLEAN HTML
+# =========================
+def clean_html(raw_html):
+    clean = re.sub('<.*?>', ' ', raw_html)
+    clean = re.sub(r'\s+', ' ', clean)
+    return clean.strip()
 
 # =========================
-# REGEX EXTRACTION
+# REGEX BASIC EXTRACTION
 # =========================
 def regex_extract(text):
-    phone = re.findall(r'Click to Call:\s*(\+?\d+)', text)
-    email = re.findall(r'E-mail:\s*([^\s]+@[^\s]+)', text)
+    phone = re.findall(r'\+?\d{10,13}', text)
+    email = re.findall(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', text)
 
     return {
         "phone": phone[0] if phone else "",
@@ -62,99 +67,81 @@ def regex_extract(text):
     }
 
 # =========================
-# PRODUCT NAME
-# =========================
-def extract_product_name(text):
-    match = re.search(r'Buylead Details:\s*\n\s*(.+)', text)
-    return match.group(1).strip() if match else ""
-
-# =========================
-# PRODUCT DETAILS (CLEAN)
-# =========================
-def extract_product_details(text):
-    try:
-        match = re.search(
-            r'Buylead Details:\s*(.*?)\s*Reply To This Message',
-            text,
-            re.DOTALL
-        )
-
-        if not match:
-            return ""
-
-        block = match.group(1)
-
-        lines = [line.strip() for line in block.split("\n") if line.strip()]
-
-        # Remove product name
-        if lines:
-            lines = lines[1:]
-
-        cleaned = []
-        i = 0
-        while i < len(lines) - 1:
-            key = lines[i].replace(":", "").strip()
-            value = lines[i+1].strip()
-            cleaned.append(f"{key}: {value}")
-            i += 2
-
-        return "\n".join(cleaned)
-
-    except Exception as e:
-        print("❌ Product parsing error:", e)
-        return ""
-
-# =========================
 # LOCATION EXTRACTION
 # =========================
 def extract_location(text):
-    try:
-        address_match = re.search(r'Port Blair.*', text)
+    match = re.search(r'([A-Za-z\s]+)-\s*(\d{6}),\s*([A-Z]{2})', text)
 
-        if address_match:
-            address = address_match.group(0)
+    city = ""
+    pincode = ""
+    state_code = ""
 
-            city_match = re.search(r'([A-Za-z\s]+)-\d{6}', address)
-            city = city_match.group(1).strip() if city_match else ""
+    if match:
+        city = match.group(1).strip()
+        pincode = match.group(2)
+        state_code = match.group(3)
 
-            return city, "India"
+    state_map = {
+        "AN": "Andaman and Nicobar Islands",
+        "MH": "Maharashtra",
+        "GJ": "Gujarat",
+        "DL": "Delhi"
+    }
 
-        return "", ""
+    state = state_map.get(state_code, "")
 
-    except:
-        return "", ""
+    return {
+        "city": city,
+        "pincode": pincode,
+        "state": state,
+        "country": "India"
+    }
 
 # =========================
-# AI EXTRACTION (NAME ONLY)
+# AI EXTRACTION
 # =========================
 def ai_extract(text):
     if not model:
         return {}
 
     prompt = f"""
-Extract ONLY the buyer name from this text.
+Extract buyer details from this email.
 
-Ignore platform names and emails.
+IMPORTANT:
+- Ignore IndiaMART platform info
+- Ignore helpline numbers
+- Extract ONLY buyer info
 
-Return JSON:
+Find:
+- name
+- phone
+- email
+- product
+- description (ONLY product specs like size, color, usage)
+- city
+- country
+
+Return ONLY JSON:
 {{
-  "name": ""
+  "name": "",
+  "phone": "",
+  "email": "",
+  "product": "",
+  "description": "",
+  "city": "",
+  "country": ""
 }}
 
-Text:
+Email:
 {text}
 """
 
     try:
         response = model.generate_content(prompt)
         raw = response.text.strip().replace("```json", "").replace("```", "")
-
-        try:
-            return json.loads(raw)
-        except:
-            return {}
-
-    except:
+        return json.loads(raw)
+    except Exception as e:
+        print("❌ AI error:", e)
         return {}
 
 # =========================
@@ -175,27 +162,16 @@ def create_odoo_lead(data):
         uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
 
         if not uid:
-            return None, "Authentication failed"
+            return None, "Auth failed"
 
         lead_vals = {
-            'name': f"{data.get('product', 'Inquiry')} - {data.get('name', '')}",
+            'name': data.get('product') or "New Lead",
             'contact_name': data.get('name') or "",
             'phone': data.get('phone') or "",
             'email_from': data.get('email') or "",
-            'description': data.get('description') or "",
             'city': data.get('city') or "",
+            'description': data.get('description') or "",
         }
-
-        # Country mapping
-        if data.get("country"):
-            country_ids = models.execute_kw(
-                ODOO_DB, uid, ODOO_PASSWORD,
-                'res.country', 'search',
-                [[('name', 'ilike', data.get("country"))]],
-                {'limit': 1}
-            )
-            if country_ids:
-                lead_vals['country_id'] = country_ids[0]
 
         lead_id = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
@@ -213,31 +189,39 @@ def create_odoo_lead(data):
 # =========================
 @app.post("/extract")
 def extract(request: EmailRequest):
-    text = request.text
+    raw_text = request.text
 
-    # Step 1: AI (name only)
+    # STEP 1: Clean HTML
+    text = clean_html(raw_text)
+
+    print("CLEAN TEXT:", text[:500])
+
+    # STEP 2: AI
     result = ai_extract(text)
 
-    # Step 2: Regex
+    # STEP 3: Regex fallback
     regex_data = regex_extract(text)
 
-    result["phone"] = regex_data.get("phone")
-    result["email"] = regex_data.get("email")
+    if not result.get("phone"):
+        result["phone"] = regex_data["phone"]
 
-    # Step 3: Structured extraction
-    result["product"] = extract_product_name(text)
-    result["description"] = extract_product_details(text)
+    if not result.get("email"):
+        result["email"] = regex_data["email"]
 
-    city, country = extract_location(text)
-    result["city"] = city
-    result["country"] = country
+    # STEP 4: Location
+    location = extract_location(text)
 
-    # Step 4: Create lead
+    result["city"] = location["city"]
+    result["country"] = location["country"]
+
+    # STEP 5: Create Lead
     lead_id, error = create_odoo_lead(result)
 
-    return {
-        "status": "success" if lead_id else "error",
-        "data": result,
-        "odoo_lead_id": lead_id,
-        "error": error
-    }
+    result["odoo_lead_id"] = lead_id
+
+    if error:
+        result["odoo_error"] = error
+
+    print("FINAL RESULT:", result)
+
+    return result
