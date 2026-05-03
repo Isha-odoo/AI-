@@ -7,6 +7,7 @@ import xmlrpc.client
 import time
 from google import genai
 from google.genai import types
+from datetime import datetime, timedelta
 
 app = FastAPI()
 
@@ -158,7 +159,7 @@ def merge(ai_data, regex_data):
     return ai_data
 
 # =========================
-# CREATE ODOO LEAD
+# CREATE ODOO LEAD (WITH TIME-BOUND DEDUPLICATION)
 # =========================
 def create_odoo_lead(data):
     try:
@@ -167,13 +168,49 @@ def create_odoo_lead(data):
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=True)
 
+        # -----------------------------------------------------
+        # ANTI-SPAM: TIME-BOUND DEDUPLICATION
+        # -----------------------------------------------------
+        search_domain = []
+        
+        # 1. Match Email or Phone
+        if data.get('email'):
+            search_domain.append(('email_from', '=', data['email']))
+        elif data.get('phone'):
+            search_domain.append(('phone', '=', data['phone']))
+            
+        # 2. Match Product Name
+        if data.get('product'):
+            search_domain.append(('name', '=', data['product']))
+
+        # 3. THE FIX: Only check for leads created in the last 24 hours
+        time_limit = (datetime.utcnow() - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
+        search_domain.append(('create_date', '>=', time_limit))
+
+        if search_domain:
+            existing_leads = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'crm.lead', 'search',
+                [search_domain]
+            )
+            if existing_leads:
+                print(f"DUPLICATE PREVENTED: Recent lead already exists in Odoo (ID: {existing_leads[0]}). Skipping.")
+                return existing_leads[0], None 
+        # -----------------------------------------------------
+
+        # Add Location data into the description
+        description_text = data.get('description', '')
+        location_info = f"{data.get('city', '')}, {data.get('state', '')}, {data.get('country', '')}".strip(", ")
+        if len(location_info) > 4:
+            description_text += f"\n\nLocation: {location_info}"
+
         lead_vals = {
             'name': data.get('product') or "New Platform Lead",
             'contact_name': data.get('name') or "",
             'phone': data.get('phone') or "",
             'email_from': data.get('email') or "",
             'city': data.get('city') or "",
-            'description': data.get('description') or "",
+            'description': description_text,
         }
 
         lead_id = models.execute_kw(
