@@ -212,6 +212,14 @@ def extract(request: EmailRequest):
 
     print("FINAL DATA:", data)
 
+    # ==========================================
+    # GUARD: PREVENT BLANK LEADS
+    # ==========================================
+    if not data.get("phone") and not data.get("email") and not data.get("name") and not data.get("product"):
+        print("SKIPPED: No actionable data found. Odoo lead not created.")
+        data["odoo_error"] = "Skipped: Payload empty or no contact/product info extracted."
+        return data
+
     lead_id, error = create_odoo_lead(data)
     data["odoo_lead_id"] = lead_id
     if error:
