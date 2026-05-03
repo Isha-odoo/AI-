@@ -14,13 +14,8 @@ class EmailRequest(BaseModel):
 # =========================
 # GEMINI CONFIG
 # =========================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-pro")
-else:
-    model = None
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+model = genai.GenerativeModel("gemini-pro")
 
 # =========================
 # ODOO CONFIG
@@ -39,41 +34,38 @@ def clean_html(raw_html):
     return text.strip()
 
 # =========================
-# AI EXTRACTION (SMART)
+# STRONG REGEX EXTRACTION
+# =========================
+def regex_extract(text):
+    return {
+        "phone": re.findall(r'\+?\d[\d\s\-]{8,15}', text),
+        "email": re.findall(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', text),
+        "pincode": re.findall(r'\b\d{5,6}\b', text)
+    }
+
+# =========================
+# AI EXTRACTION (PRIMARY)
 # =========================
 def ai_extract(text):
-    if not model:
-        return {}
 
     prompt = f"""
-You are an expert at extracting CRM lead data from emails.
+Extract CRM lead info.
 
-STRICT RULES:
-- Ignore platform emails (IndiaMART, Alibaba, Expo systems)
-- Ignore helpline numbers
-- Extract ONLY buyer/customer details
-- Understand ANY format (not fixed template)
+STRICT:
+- Ignore platform/system numbers
+- Only buyer info
+- Detect any country/state globally
 
-Extract:
-- name (person name)
-- phone
-- email
-- product (what buyer wants)
-- description (only product requirements/specs)
-- city
-- state
-- country
-
-Return ONLY valid JSON:
+Return JSON:
 {{
-  "name": "",
-  "phone": "",
-  "email": "",
-  "product": "",
-  "description": "",
-  "city": "",
-  "state": "",
-  "country": ""
+"name": "",
+"phone": "",
+"email": "",
+"product": "",
+"description": "",
+"city": "",
+"state": "",
+"country": ""
 }}
 
 Email:
@@ -81,32 +73,84 @@ Email:
 """
 
     try:
-        response = model.generate_content(prompt)
-        raw = response.text.strip().replace("```json", "").replace("```", "")
+        res = model.generate_content(prompt)
+        raw = res.text.strip().replace("```json", "").replace("```", "")
         return json.loads(raw)
-    except Exception as e:
-        print("AI ERROR:", e)
+    except:
         return {}
 
 # =========================
-# REGEX FALLBACK (GENERIC)
+# FIELD VALIDATION
 # =========================
-def regex_fallback(text, result):
+def validate(data):
 
-    if not result.get("phone"):
-        phone = re.findall(r'\+?\d[\d\s\-]{8,15}', text)
-        if phone:
-            result["phone"] = phone[0]
+    # phone cleanup
+    if data.get("phone"):
+        data["phone"] = re.sub(r'[^\d+]', '', data["phone"])
 
-    if not result.get("email"):
-        email = re.findall(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', text)
-        if email:
-            result["email"] = email[0]
+    # email check
+    if data.get("email") and "@" not in data["email"]:
+        data["email"] = ""
 
-    return result
+    # remove junk names
+    if data.get("name") and len(data["name"]) < 3:
+        data["name"] = ""
+
+    return data
 
 # =========================
-# ODOO CREATE LEAD
+# SECOND AI (FILL MISSING)
+# =========================
+def ai_fill_missing(text, data):
+
+    missing_fields = [k for k, v in data.items() if not v]
+
+    if not missing_fields:
+        return data
+
+    prompt = f"""
+Fill ONLY missing fields: {missing_fields}
+
+Existing data:
+{json.dumps(data)}
+
+Email:
+{text}
+
+Return JSON only.
+"""
+
+    try:
+        res = model.generate_content(prompt)
+        raw = res.text.strip().replace("```json", "").replace("```", "")
+        extra = json.loads(raw)
+
+        for k in missing_fields:
+            if extra.get(k):
+                data[k] = extra[k]
+
+    except:
+        pass
+
+    return data
+
+# =========================
+# MERGE LOGIC (SMART)
+# =========================
+def merge(ai_data, regex_data):
+
+    # phone
+    if not ai_data.get("phone") and regex_data["phone"]:
+        ai_data["phone"] = regex_data["phone"][0]
+
+    # email
+    if not ai_data.get("email") and regex_data["email"]:
+        ai_data["email"] = regex_data["email"][0]
+
+    return ai_data
+
+# =========================
+# CREATE ODOO LEAD
 # =========================
 def create_odoo_lead(data):
     try:
@@ -145,31 +189,33 @@ def create_odoo_lead(data):
 @app.post("/extract")
 def extract(request: EmailRequest):
 
-    # STEP 1: Clean
     text = clean_html(request.text)
 
-    print("CLEAN TEXT:", text[:300])
+    # 1. AI
+    ai_data = ai_extract(text)
 
-    # STEP 2: AI extraction
-    result = ai_extract(text)
+    # 2. Regex
+    regex_data = regex_extract(text)
 
-    print("AI RESULT:", result)
+    # 3. Merge
+    data = merge(ai_data, regex_data)
 
-    # STEP 3: Fallback
-    result = regex_fallback(text, result)
+    # 4. Validate
+    data = validate(data)
 
-    # STEP 4: Default country if missing
-    if not result.get("country"):
-        result["country"] = "India"  # you can remove if global
+    # 5. Fill missing
+    data = ai_fill_missing(text, data)
 
-    # STEP 5: Create lead
-    lead_id, error = create_odoo_lead(result)
+    # 6. Final validation
+    data = validate(data)
 
-    result["odoo_lead_id"] = lead_id
+    print("FINAL DATA:", data)
 
+    # 7. Odoo
+    lead_id, error = create_odoo_lead(data)
+
+    data["odoo_lead_id"] = lead_id
     if error:
-        result["odoo_error"] = error
+        data["odoo_error"] = error
 
-    print("FINAL RESULT:", result)
-
-    return result
+    return data
