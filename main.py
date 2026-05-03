@@ -9,6 +9,9 @@ from google.genai import types
 
 app = FastAPI()
 
+# =========================
+# SCHEMAS
+# =========================
 class EmailRequest(BaseModel):
     text: str
 
@@ -36,6 +39,13 @@ ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USERNAME = os.getenv("ODOO_USERNAME")
 ODOO_PASSWORD = os.getenv("ODOO_API_KEY")
+
+# =========================
+# RENDER HEALTH CHECK
+# =========================
+@app.get("/")
+def health_check():
+    return {"status": "Live", "message": "Lead Automation API is running. Send POST requests to /extract."}
 
 # =========================
 # CLEAN HTML
