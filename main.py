@@ -18,6 +18,7 @@ class EmailRequest(BaseModel):
 
 class LeadSchema(BaseModel):
     name: str
+    company_name: str  # Added for Company Name
     phone: str
     email: str
     product: str
@@ -27,6 +28,7 @@ class LeadSchema(BaseModel):
     state: str
     pincode: str
     country: str
+    source: str  # Added for Tags/Source
 
 # =========================
 # INIT NEW GEMINI SDK
@@ -71,22 +73,24 @@ def regex_extract(text):
 # =========================
 def ai_extract(text):
     prompt = """
-You are a precise CRM data extraction assistant specializing in B2B platform lead emails (e.g., IndiaMART). 
-Extract the ACTUAL BUYER'S information. Completely ignore platform support numbers (like 096-9696-9696) and platform emails (like buyleads@indiamart.com).
+You are a precise CRM data extraction assistant. You process leads from B2B platforms (IndiaMART, Alibaba) AND standard website contact forms. 
+Extract the ACTUAL BUYER'S information. Completely ignore platform support numbers and system emails.
 
 RULES:
-1. name: Extract the buyer's personal name and/or company name.
-2. phone: Extract the buyer's direct phone number.
-3. email: Extract the buyer's personal/business email.
-4. product: The main item requested (e.g., under "Buylead Details" or "Product").
-5. description: Combine all product specifications into a comma-separated string.
-6. address: Extract the street address or local area.
-7. city: Extract the city.
-8. state: Extract the state.
-9. pincode: Extract the postal code / zip code.
-10. country: Output ONLY the official 2-letter ISO country code (e.g., "IN" for India, "US" for United States).
+1. name: Extract the buyer's personal contact name. Look for labels like "Your Name", "Sender", or the sign-off at the end of the message (e.g., "Weston Turner").
+2. company_name: Extract the buyer's company name. Look for labels like "Your Company", "Company Name", or text like "I represent [Company]".
+3. phone: Extract the buyer's direct phone number. Look for labels like "Phone No", "Mobile", etc.
+4. email: Extract the buyer's personal/business email. Look for "Your Email".
+5. product: The main item requested. If not explicitly stated, infer from the message. If it's a general inquiry, write "General Inquiry".
+6. description: Combine all product specifications or the core message into a string.
+7. address: Extract the street address or local area.
+8. city: Extract the city.
+9. state: Extract the state.
+10. pincode: Extract the postal code / zip code.
+11. country: Output ONLY the official 2-letter ISO country code (e.g., "US" for United States, "IN" for India).
+12. source: Identify the source of the lead based on keywords. Choose ONLY ONE: "IndiaMART", "Alibaba", "Website", "Medical Expo". If the email mentions "contact form on" or "Inquiry form website", output "Website".
 
-If a value is missing, return an empty string "".
+If a value is missing or not provided, return an empty string "".
 """
     max_retries = 3
     
@@ -122,10 +126,9 @@ If a value is missing, return an empty string "".
             
             # If it's a different error or we ran out of retries, fail safely
             return {
-                "name": "", "phone": "", "email": "", "product": "", 
-                "description": "", "address": "", "city": "", "state": "", "pincode": "", "country": ""
+                "name": "", "company_name": "", "phone": "", "email": "", "product": "", 
+                "description": "", "address": "", "city": "", "state": "", "pincode": "", "country": "", "source": ""
             }
-
 # =========================
 # FIELD VALIDATION
 # =========================
@@ -187,14 +190,20 @@ def create_odoo_lead(data):
         if valid_address_parts:
             desc_text += f"\n\nFull Address: {', '.join(valid_address_parts)}"
 
+        # Formatting the Lead Title with the Source Tag
+        source_val = data.get('source')
+        source_prefix = f"[{source_val}] " if source_val and source_val != "Other" else ""
+        product_name = data.get('product') or "New Platform Lead"
+
         lead_vals = {
-            'name': data.get('product') or "New Platform Lead",
+            'name': f"{source_prefix}{product_name}",  # e.g., "[IndiaMART] Gelfoam Sponge"
+            'partner_name': data.get('company_name') or "", # Odoo's native field for Company Name
             'contact_name': data.get('name') or "",
             'phone': data.get('phone') or "",
             'email_from': data.get('email') or "",
-            'street': data.get('address') or "",  # Native Odoo address field
-            'city': data.get('city') or "",       # Native Odoo city field
-            'zip': data.get('pincode') or "",     # Native Odoo zip/pincode field
+            'street': data.get('address') or "",  
+            'city': data.get('city') or "",       
+            'zip': data.get('pincode') or "",     
             'description': desc_text.strip(),
         }
 
@@ -228,7 +237,7 @@ def extract(request: EmailRequest):
     # STRICT GUARD: PREVENT BLANK / GHOST LEADS
     # ==========================================
     has_contact = bool(data.get("phone") or data.get("email"))
-    has_context = bool(data.get("name") or data.get("product"))
+    has_context = bool(data.get("name") or data.get("company_name") or data.get("product"))
 
     if not (has_contact and has_context):
         print("SKIPPED: Not a valid lead. Dropping payload to protect Odoo.")
