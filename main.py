@@ -28,7 +28,7 @@ class LeadSchema(BaseModel):
     state: str
     pincode: str
     country: str
-    source: str  # Added for Tags/Source
+    source: str  # Added for Odoo Tags
 
 # =========================
 # INIT NEW GEMINI SDK
@@ -44,7 +44,7 @@ ODOO_USERNAME = os.getenv("ODOO_USERNAME")
 ODOO_PASSWORD = os.getenv("ODOO_API_KEY")
 
 # =========================
-# RENDER HEALTH CHECK
+# HEALTH CHECK
 # =========================
 @app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
@@ -77,7 +77,7 @@ You are a precise CRM data extraction assistant. You process leads from B2B plat
 Extract the ACTUAL BUYER'S information. Completely ignore platform support numbers and system emails.
 
 RULES:
-1. name: Extract the buyer's personal contact name. Look for labels like "Your Name", "Sender", or the sign-off at the end of the message (e.g., "Weston Turner").
+1. name: Extract the buyer's personal contact name. Look for labels like "Your Name", "Sender", or the sign-off at the end of the message.
 2. company_name: Extract the buyer's company name. Look for labels like "Your Company", "Company Name", or text like "I represent [Company]".
 3. phone: Extract the buyer's direct phone number. Look for labels like "Phone No", "Mobile", etc.
 4. email: Extract the buyer's personal/business email. Look for "Your Email".
@@ -129,6 +129,7 @@ If a value is missing or not provided, return an empty string "".
                 "name": "", "company_name": "", "phone": "", "email": "", "product": "", 
                 "description": "", "address": "", "city": "", "state": "", "pincode": "", "country": "", "source": ""
             }
+
 # =========================
 # FIELD VALIDATION
 # =========================
@@ -166,7 +167,7 @@ def merge(ai_data, regex_data):
     return ai_data
 
 # =========================
-# CREATE ODOO LEAD
+# CREATE ODOO LEAD (WITH TAGS)
 # =========================
 def create_odoo_lead(data):
     try:
@@ -184,20 +185,43 @@ def create_odoo_lead(data):
             data.get('pincode'), 
             data.get('country')
         ]
-        # Filter out empty strings so it formats cleanly
-        valid_address_parts = [p for p in address_parts if p]
         
+        valid_address_parts = [p for p in address_parts if p]
         if valid_address_parts:
             desc_text += f"\n\nFull Address: {', '.join(valid_address_parts)}"
 
-        # Formatting the Lead Title with the Source Tag
-        source_val = data.get('source')
-        source_prefix = f"[{source_val}] " if source_val and source_val != "Other" else ""
         product_name = data.get('product') or "New Platform Lead"
+        source_val = data.get('source')
 
+        # ==========================================
+        # ODOO NATIVE TAG HANDLING (crm.tag)
+        # ==========================================
+        tag_ids = []
+        if source_val and source_val != "Other":
+            # 1. Search if the tag already exists in Odoo
+            existing_tags = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'crm.tag', 'search',
+                [[('name', '=', source_val)]]
+            )
+            
+            if existing_tags:
+                tag_ids.append(existing_tags[0])
+            else:
+                # 2. If it doesn't exist, create it on the fly
+                new_tag_id = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD,
+                    'crm.tag', 'create',
+                    [{'name': source_val}]
+                )
+                tag_ids.append(new_tag_id)
+
+        # ==========================================
+        # BUILD LEAD VALUES
+        # ==========================================
         lead_vals = {
-            'name': f"{source_prefix}{product_name}",  # e.g., "[IndiaMART] Gelfoam Sponge"
-            'partner_name': data.get('company_name') or "", # Odoo's native field for Company Name
+            'name': product_name,  # Clean Lead Name
+            'partner_name': data.get('company_name') or "", 
             'contact_name': data.get('name') or "",
             'phone': data.get('phone') or "",
             'email_from': data.get('email') or "",
@@ -207,6 +231,11 @@ def create_odoo_lead(data):
             'description': desc_text.strip(),
         }
 
+        # Apply the tags using Odoo's Many2many syntax [(6, 0, [IDs])]
+        if tag_ids:
+            lead_vals['tag_ids'] = [(6, 0, tag_ids)]
+
+        # Create the Lead
         lead_id = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'crm.lead', 'create',
@@ -217,7 +246,7 @@ def create_odoo_lead(data):
         return None, str(e)
 
 # =========================
-# MAIN API
+# MAIN API ENDPOINT
 # =========================
 @app.post("/extract")
 def extract(request: EmailRequest):
